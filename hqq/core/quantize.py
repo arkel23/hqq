@@ -382,6 +382,68 @@ class HQQMatmulCachedDeq(torch.autograd.Function):
 
 
 # Main linear layer
+# ---------------------------------------------------------------------------
+# Activation fake-quantization (for HQQLinear's opt-in act_bits / trainable QAT
+# modes below).
+#
+# Deliberately a copy of `fake_quant_activation` in hqq/core/quantize_v2.py rather
+# than an import: quantize_v2.py already imports FROM this module, so importing back
+# would be circular. Kept byte-identical in behavior so a `trainable` HQQLinear and an
+# HQQLinearV2 with the same act_bits/act_group_size agree exactly - which is what makes
+# the two comparable while both exist. If quantize_v2.py is eventually removed, this
+# becomes the single copy.
+# ---------------------------------------------------------------------------
+ACT_BITS_CHOICES = (1, 1.58, 2, 3, 4, 5, 6, 7, 8)
+MIN_ACT_GROUP_SIZE = 8
+
+
+def fake_quant_activation(x: Tensor, num_bits=None, group_size=None) -> Tensor:
+    """BitNet-style symmetric per-token activation fake-quantization, with an optional
+    per-group scale along the channel (last) dimension. `num_bits=None` is a no-op."""
+    if num_bits is None:
+        return x
+    assert num_bits in ACT_BITS_CHOICES, (
+        f"num_bits={num_bits} not supported, choose one of {ACT_BITS_CHOICES} or None"
+    )
+
+    channels = x.shape[-1]
+    if group_size is None:
+        group_size = channels
+    assert group_size >= MIN_ACT_GROUP_SIZE, (
+        f"activation group_size={group_size} is below the minimum of {MIN_ACT_GROUP_SIZE}"
+    )
+    assert group_size <= channels, (
+        f"activation group_size={group_size} exceeds the channel dimension ({channels})"
+    )
+    assert channels % group_size == 0, (
+        f"channel dimension ({channels}) must be divisible by activation group_size ({group_size})"
+    )
+
+    x_dtype = x.dtype
+    orig_shape = x.shape
+    num_groups = channels // group_size
+    xf = x.float().reshape(*orig_shape[:-1], num_groups, group_size)
+
+    if num_bits == 1:
+        # The general symmetric-affine formula degenerates at 1 bit (Qp = 0 -> scale 0),
+        # so fall back to sign-based binary scaled by the mean absolute value.
+        scale = 1.0 / xf.abs().mean(dim=-1, keepdim=True).clamp(min=1e-5)
+        sign = torch.sign(xf)
+        sign = torch.where(sign == 0, torch.ones_like(sign), sign)  # sign(0) -> +1
+        xq = sign / scale
+    elif num_bits == 1.58:
+        scale = 1.0 / xf.abs().mean(dim=-1, keepdim=True).clamp(min=1e-5)
+        xq = (xf * scale).round().clamp(-1, 1) / scale
+    else:
+        nb = int(num_bits)
+        Qn = -(2 ** (nb - 1))
+        Qp = 2 ** (nb - 1) - 1
+        scale = Qp / xf.abs().max(dim=-1, keepdim=True).values.clamp(min=1e-5)
+        xq = (xf * scale).round().clamp(Qn, Qp) / scale
+
+    return xq.reshape(orig_shape).to(x_dtype)
+
+
 PRINT_ZERO_SCALE_DEPRECATED = True
 PRINT_ATEN_WARNING = True
 class HQQLinear(nn.Module):
@@ -396,7 +458,48 @@ class HQQLinear(nn.Module):
         compute_dtype: torch.dtype = float16,
         device: str = "cuda",
         initialize: bool = True,
+        act_bits: Union[int, float, None] = None,
+        act_group_size: Union[int, None] = None,
+        trainable: bool = False,
     ):
+        """
+        `act_bits` / `act_group_size` (both default None = off, i.e. full-precision
+        activations exactly as before): fake-quantize the input activation on every
+        forward, in {1, 1.58, 2, 3, 4, 5, 6, 7, 8} bits. `act_group_size=None` means
+        per-tensor. See `fake_quant_activation` above. Activations are ALWAYS computed
+        dynamically (there is nothing to calibrate offline about them), in both train and
+        eval mode - unlike the weights below.
+
+        `trainable` (default False = the packed, frozen, inference-only layer this class
+        has always been): opt into BitNet-style QAT on the weights. A plain `HQQLinear`
+        can pass gradients THROUGH to upstream modules but can never have its own weight
+        updated - `HQQMatmulNoCacheDeq.backward` returns `grad_weight = None`, which is
+        structural, not a setting. `trainable=True` instead keeps a full-precision master
+        weight as an `nn.Parameter` named `master_weight` and fake-quantizes it with a straight-through
+        estimator, so the weight itself can be optimized:
+
+          - construction: HQQ's real iterative calibration runs ONCE (whatever
+            `weight_quant_params['optimize']` says, default True) and the resulting
+            scale/zero are cached as buffers. This is the important bit - it means a
+            trainable layer starts from genuine HQQ scales, not from naive min/max.
+          - `.train()`: scale/zero are recomputed cheaply (round-to-nearest, no
+            proximal iterations) from the CURRENT weights each step, BitNet-style, so
+            the layer tracks the weights as they move. Gradients reach the master
+            weight through the STE.
+          - `.eval()`: the cached, HQQ-calibrated scale/zero are reused as-is. This is
+            the "HQQ was already good for inference" path - only activations stay dynamic.
+          - `recalibrate()`: re-run the full HQQ optimization against the current
+            (drifted) weights and refresh the cached scale/zero. Worth calling
+            periodically during a long run, and once before final eval/export.
+          - `freeze()`: rebuild the packed `W_q`/`meta` from the trained master weight,
+            drop the master, and return to being an ordinary packed `HQQLinear` - i.e.
+            the train-then-deploy export step.
+
+        Per-instance memory note: in `trainable` mode only the fp master weight is
+        stored (plus the tiny per-group scale/zero buffers); there is no packed `W_q`
+        until `freeze()`. That is inherent to QAT - an optimizer needs something
+        differentiable to update - and is why `trainable` is opt-in rather than default.
+        """
         super().__init__()
         self.ready = False
         self.in_gpu = False
@@ -412,6 +515,41 @@ class HQQLinear(nn.Module):
             if (self.quant_config is not None)
             else None
         )
+
+        # These three can arrive EITHER as explicit kwargs (direct construction) or as keys
+        # inside `quant_config` itself. The dict route is what makes the settings reachable
+        # through an unmodified `transformers.HqqConfig`: HqqConfig stores a plain
+        # BaseQuantizeConfig dict, which travels unchanged into
+        # quantizer_hqq.create_quantized_param() and is handed to this constructor as
+        # `quant_config`. So
+        #
+        #     qcfg = HqqConfig(nbits=3, group_size=64, axis=1)
+        #     qcfg.quant_config["trainable"] = True
+        #     qcfg.quant_config["act_bits"] = 8
+        #     AutoModel.from_pretrained(..., quantization_config=qcfg)
+        #
+        # works with NO change to transformers at all - no HqqConfig subclass, no custom
+        # quantizer, no post-load conversion pass. With a per-layer `dynamic_config`, each
+        # layer gets its own dict, so this is also per-layer configurable for free.
+        #
+        # They must be POPPED, not just read: initialize() forwards the rest of the dict as
+        # `self.quantize(W, **self.quant_config)`, which only accepts the three
+        # *_quant_params keys, so any leftover key raises an unexpected-kwarg TypeError.
+        # Same pattern as `offload_meta` just above.
+        _cfg = self.quant_config if isinstance(self.quant_config, dict) else {}
+        cfg_act_bits = _cfg.pop("act_bits", None)
+        cfg_act_group_size = _cfg.pop("act_group_size", None)
+        cfg_trainable = _cfg.pop("trainable", False)
+        # Explicit kwargs win when given, so direct construction keeps overriding the config.
+        self.act_bits = act_bits if act_bits is not None else cfg_act_bits
+        self.act_group_size = (
+            act_group_size if act_group_size is not None else cfg_act_group_size
+        )
+        self.trainable = bool(trainable or cfg_trainable)
+        if self.act_bits is not None:
+            assert self.act_bits in ACT_BITS_CHOICES, (
+                f"act_bits={self.act_bits} not supported, choose one of {ACT_BITS_CHOICES} or None"
+            )
 
         self.set_backend(HQQLinear.backend)
 
@@ -446,7 +584,10 @@ class HQQLinear(nn.Module):
                     else self.linear_layer.out_features
                 )
                 
-            self.quantize(self.linear_layer.weight.data, **self.quant_config)
+            if self.trainable:
+                self._initialize_trainable(self.linear_layer)
+            else:
+                self.quantize(self.linear_layer.weight.data, **self.quant_config)
             self.bias = (
                 None
                 if (self.linear_layer.bias is None)
@@ -454,6 +595,9 @@ class HQQLinear(nn.Module):
                     device=self.device, dtype=self.compute_dtype
                 )
             )
+            if self.trainable and self.bias is not None:
+                # Bias is trained alongside the weight in QAT mode (it is never quantized).
+                self.bias = nn.Parameter(self.bias, requires_grad=True)
 
             #Clear-up parameters
             if self.del_orig:
@@ -509,7 +653,13 @@ class HQQLinear(nn.Module):
             )
             PRINT_ATEN_WARNING = False
         HQQLinear.backend = backend
-        cls.forward = getattr(cls, backend.value)
+        # Assigns the BACKEND slot, not `forward` itself. `forward` is now a fixed
+        # dispatcher (see below) so that per-instance settings - activation quantization
+        # and the trainable/QAT weight path - can be honored; `cls.forward` is class-level
+        # state and therefore cannot express a per-layer choice. Every existing caller of
+        # set_backend() is unaffected, and a non-trainable layer with act_bits=None still
+        # reaches exactly the same backend function as before.
+        cls._forward_backend = getattr(cls, backend.value)
 
     # TODO: rewrite this mess
     def cuda(self, device):
@@ -831,6 +981,163 @@ class HQQLinear(nn.Module):
         self.meta = meta
         self.cuda(self.device)
         self.ready = True
+
+    ############################################################################################
+    # QAT / trainable-weight path (opt-in via trainable=True) + activation quantization
+    ##########################################################################################
+    def _wqp(self) -> dict:
+        """The resolved weight_quant_params for this layer (nbits/group_size/axis/...)."""
+        return self.quant_config["weight_quant_params"]
+
+    def _grouped(self, W: Tensor):
+        """Reshape W into the (group_size-wide) layout Quantizer.quantize works in, exactly
+        as it does - so cached scale/zero line up with the weights they were fit on."""
+        p = self._wqp()
+        group_size, axis, channel_wise = p["group_size"], p["axis"], p["channel_wise"]
+        shape = W.shape
+        if (group_size is not None) and channel_wise:
+            W = W.reshape([-1, group_size]) if (axis == 1) else W.reshape([group_size, -1])
+        return W, shape
+
+    # NOTE ON THE NAME `master_weight`: it is deliberately NOT `weight`.
+    # transformers/quantizers/quantizer_hqq.py monkey-patches
+    # `HQQLinear.weight = property(lambda self: torch.empty(0, ...))` at import time as a
+    # compatibility hack (some models read `layer.weight.dtype` during forward). A property
+    # is a DATA DESCRIPTOR, so it takes precedence over instance attribute lookup: naming
+    # the master weight `weight` both (a) makes `self.weight = nn.Parameter(...)` raise
+    # KeyError("attribute 'weight' already exists") from register_parameter, and worse
+    # (b) would silently return that EMPTY tensor rather than the real master weight to
+    # anything reading `layer.weight`. Real failure, hit while loading a model through
+    # HqqConfig; it does not reproduce unless transformers' hqq quantizer has been imported,
+    # which is why it slipped past the first version of the CPU tests.
+    def _initialize_trainable(self, linear_layer) -> None:
+        W = linear_layer.weight.data.to(device=self.device, dtype=self.compute_dtype)
+        self.in_features, self.out_features = W.t().shape
+        self.master_weight = nn.Parameter(W.clone(), requires_grad=True)
+        # The one-time real HQQ calibration. This is what makes a trainable HQQLinear
+        # actually HQQ rather than a generic min/max quantizer.
+        self.recalibrate()
+        self.W_q, self.meta = None, None  # no packed weight exists until freeze()
+        self.ready = True
+
+    @torch.no_grad()
+    def recalibrate(self) -> None:
+        """(Re-)run HQQ's calibration on the CURRENT weights and cache the resulting
+        scale/zero. Called once at construction; call again after the weights have drifted
+        during training, and once before final eval/export. Honors this layer's own
+        `optimize` setting, so the proximal (half-quadratic) solver runs whenever it is on."""
+        assert self.trainable, "recalibrate() only applies to a trainable=True HQQLinear"
+        p = dict(self._wqp())
+        # bitpack=False: we want the raw scale/zero, not a packed weight.
+        _, meta = Quantizer.quantize(
+            self.master_weight.data, bitpack=False, device=self.device,
+            compute_dtype=self.compute_dtype, **p,
+        )
+        # meta["scale"] is stored INVERTED (Quantizer.dequantize multiplies by it), so keep
+        # the same convention here and divide when quantizing.
+        #
+        # .clone() is REQUIRED, not defensive copying: optimize_weights_proximal is
+        # decorated @torch.inference_mode() (hqq/core/optimize.py), so with optimize=True
+        # the scale/zero it returns are *inference tensors*. Those can never be updated
+        # in-place outside inference mode, nor participate in autograd - storing them
+        # directly made the second recalibrate() call raise
+        # "Inplace update to inference tensor outside InferenceMode is not allowed".
+        # Cloning outside inference mode is the documented way back to a normal tensor.
+        scale = meta["scale"].detach().clone().contiguous()
+        zero = meta["zero"].detach().clone().contiguous()
+        if "calib_scale" in self._buffers:
+            # Reassign rather than copy_ so a shape change (e.g. after a group_size tweak)
+            # is not silently a mismatch.
+            self.calib_scale = scale
+            self.calib_zero = zero
+        else:
+            self.register_buffer("calib_scale", scale)
+            self.register_buffer("calib_zero", zero)
+
+    def _fake_quant_weight(self, W: Tensor, scale: Tensor, zero: Tensor) -> Tensor:
+        """Affine quantize-dequantize of W using the GIVEN scale/zero, in the library's own
+        convention (scale is the inverted one, as stored in meta)."""
+        p = self._wqp()
+        max_v = round(2 ** p["nbits"] - 1)
+        Wg, shape = self._grouped(W.float())
+        W_q = (Wg / scale + zero).round().clamp_(0, max_v)
+        return ((W_q - zero) * scale).reshape(shape).to(W.dtype)
+
+    def _weight_for_forward(self) -> Tensor:
+        W = self.master_weight
+        if self.training:
+            # BitNet-style: track the moving weights with cheap round-to-nearest scale/zero
+            # (no proximal iterations - far too slow per step), and let gradients pass
+            # straight through to the fp master weight.
+            with torch.no_grad():
+                p = dict(self._wqp())
+                p["optimize"] = False
+                _, meta = Quantizer.quantize(
+                    W.data, bitpack=False, device=W.device,
+                    compute_dtype=self.compute_dtype, **p,
+                )
+                Wq = self._fake_quant_weight(W.data, meta["scale"], meta["zero"])
+            return W + (Wq - W).detach()
+        with torch.no_grad():
+            # Frozen, HQQ-calibrated scale/zero - the "HQQ was already good for inference"
+            # path. Only activations remain dynamic.
+            return self._fake_quant_weight(W, self.calib_scale, self.calib_zero)
+
+    def _quant_act(self, x: Tensor) -> Tensor:
+        if self.act_bits is None:
+            return x
+        if self.training:
+            xq = fake_quant_activation(x, self.act_bits, self.act_group_size)
+            return x + (xq - x).detach()
+        with torch.no_grad():
+            return fake_quant_activation(x, self.act_bits, self.act_group_size)
+
+    def forward_qat(self, x: Tensor) -> Tensor:
+        W = self._weight_for_forward()
+        bias = self.bias
+        if W.dtype != x.dtype:
+            W = W.to(x.dtype)
+        if bias is not None and bias.dtype != x.dtype:
+            bias = bias.to(x.dtype)
+        return torch.nn.functional.linear(x, W, bias)
+
+    @torch.no_grad()
+    def freeze(self) -> "HQQLinear":
+        """Turn a trained, trainable=True layer back into an ordinary packed HQQLinear:
+        re-calibrate on the final weights, build the packed W_q/meta, and drop the fp
+        master. This is the train-then-deploy export step (it is also what lets a QAT
+        result be served through the normal packed/backend paths)."""
+        assert self.trainable, "freeze() only applies to a trainable=True HQQLinear"
+        W = self.master_weight.data.clone()
+        bias = None if self.bias is None else self.bias.data.clone()
+        del self.master_weight
+        # In trainable mode bias is an nn.Parameter; a frozen HQQLinear holds a plain
+        # tensor there, and nn.Module.__setattr__ refuses to overwrite a registered
+        # parameter with a non-Parameter, so drop the registration first.
+        if "bias" in self._parameters:
+            del self._parameters["bias"]
+            # Re-create it as a PLAIN attribute immediately: quantize() below calls
+            # self.cuda(), which reads self.bias, and deleting the registration alone
+            # leaves the attribute missing entirely (nn.Module.__getattr__ would raise).
+            # The real value is restored after quantize().
+            self.bias = None
+        for name in ("calib_scale", "calib_zero"):
+            if name in self._buffers:
+                del self._buffers[name]
+        self.trainable = False
+        self.quantize(W, **self.quant_config)  # runs the real HQQ calibration again
+        self.bias = bias
+        return self
+
+    def forward(self, x: Tensor) -> Tensor:
+        """Single dispatch point. Activation quantization (opt-in, dynamic in both modes)
+        is applied first, then either the QAT path or whichever compiled/pytorch backend
+        `set_backend()` selected. Non-trainable + act_bits=None is byte-for-byte the
+        original behavior, just one extra Python call deep."""
+        x = self._quant_act(x)
+        if self.trainable:
+            return self.forward_qat(x)
+        return self._forward_backend(x)
 
     def unpack(self, reshape=False, dtype=None):
         if self.ready is False:
