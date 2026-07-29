@@ -599,6 +599,11 @@ class HQQLinear(nn.Module):
                 # Bias is trained alongside the weight in QAT mode (it is never quantized).
                 self.bias = nn.Parameter(self.bias, requires_grad=True)
 
+            # Route through the feature wrapper only if a feature is actually in use, so a
+            # plain HQQLinear keeps upstream's zero-indirection `cls.forward` path.
+            if (self.act_bits is not None) or self.trainable:
+                self.forward = self._forward_features
+
             #Clear-up parameters
             if self.del_orig:
                 for name, param in self.linear_layer.named_parameters():
@@ -653,13 +658,7 @@ class HQQLinear(nn.Module):
             )
             PRINT_ATEN_WARNING = False
         HQQLinear.backend = backend
-        # Assigns the BACKEND slot, not `forward` itself. `forward` is now a fixed
-        # dispatcher (see below) so that per-instance settings - activation quantization
-        # and the trainable/QAT weight path - can be honored; `cls.forward` is class-level
-        # state and therefore cannot express a per-layer choice. Every existing caller of
-        # set_backend() is unaffected, and a non-trainable layer with act_bits=None still
-        # reaches exactly the same backend function as before.
-        cls._forward_backend = getattr(cls, backend.value)
+        cls.forward = getattr(cls, backend.value)
 
     # TODO: rewrite this mess
     def cuda(self, device):
@@ -1093,6 +1092,7 @@ class HQQLinear(nn.Module):
             return fake_quant_activation(x, self.act_bits, self.act_group_size)
 
     def forward_qat(self, x: Tensor) -> Tensor:
+        x = self._quant_act(x)
         W = self._weight_for_forward()
         bias = self.bias
         if W.dtype != x.dtype:
@@ -1129,15 +1129,18 @@ class HQQLinear(nn.Module):
         self.bias = bias
         return self
 
-    def forward(self, x: Tensor) -> Tensor:
-        """Single dispatch point. Activation quantization (opt-in, dynamic in both modes)
-        is applied first, then either the QAT path or whichever compiled/pytorch backend
-        `set_backend()` selected. Non-trainable + act_bits=None is byte-for-byte the
-        original behavior, just one extra Python call deep."""
-        x = self._quant_act(x)
+    def _forward_features(self, x: Tensor) -> Tensor:
+        """Forward for layers that opted into activation quantization or the trainable/QAT
+        path. Installed as an INSTANCE attribute in `initialize()` - the same idiom
+        hqq.utils.patching.patch_hqq_inference uses - so `set_backend()` keeps assigning
+        `cls.forward` exactly as upstream does, and a layer using neither feature pays no
+        dispatch cost at all.
+
+        `type(self).forward` is looked up per call rather than captured, so calling
+        `set_backend()` after this layer was built is still honored."""
         if self.trainable:
             return self.forward_qat(x)
-        return self._forward_backend(x)
+        return type(self).forward(self, self._quant_act(x))
 
     def unpack(self, reshape=False, dtype=None):
         if self.ready is False:
