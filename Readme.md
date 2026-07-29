@@ -196,6 +196,19 @@ than `act_bits=1.58`. At 2 bits the symmetric affine formula gives `Qp = 1`, i.e
 relative error on a normal input: `1: 0.610, 1.58: 0.520, 2: 0.787, 3: 0.290, 8: 0.007`. Prefer
 1.58 over 2. `tests/test_hqqlinear_qat.py` pins this deliberately.
 
+#### Interaction with `prepare_for_inference`
+
+The native path honours `act_bits`: `prepare_for_inference(model)` replaces each layer's
+`forward`, and that replacement routes the activation through the layer's own quantizer.
+
+The **external** backends (`gemlite`, `bitblas`, `torchao_int4`) replace the `HQQLinear`
+object with their own class and cannot apply activation quantization at all, so
+`prepare_for_inference` raises if any layer has `act_bits` set rather than silently returning
+a model that runs full-precision activations. Drop `act_bits` or stay on the native backend.
+
+`prepare_for_inference` is an inference step; call `freeze()` on a `trainable=True` layer
+before using it.
+
 See `tests/test_hqqlinear_qat.py` for runnable examples — CPU-only, no model download.
 
 ### Backends

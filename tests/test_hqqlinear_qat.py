@@ -8,6 +8,11 @@ model. Run:
 
     python hqq/tests/test_hqqlinear_qat.py
 
+Install the package first so `import hqq` resolves to this checkout rather than any
+pip-installed copy:
+
+    pip install -e .
+
 No pytest dependency - plain asserts, exits non-zero on the first failure.
 
 Note: the cross-check that this module's `fake_quant_activation` matches HQQLinearV2's copy
@@ -18,10 +23,7 @@ import os
 import sys
 from pathlib import Path
 
-# This file lives in <repo>/tests/, so the repo root is one level up - not three, as it was
-# when this test lived under hqq/tests/ in the QuantizedASR checkout.
 _REPO_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(_REPO_ROOT))
 
 import torch
 from torch import nn
@@ -29,7 +31,8 @@ from torch import nn
 from hqq.core.quantize import HQQLinear, BaseQuantizeConfig
 
 import hqq as _hqq
-# hqq is also pip-installed; without this the suite can silently test site-packages
+# hqq may also be pip-installed. Without an editable install of THIS repo, `import hqq`
+# resolves to site-packages and the suite would silently test the wrong code.
 assert Path(_hqq.__file__).resolve().is_relative_to(_REPO_ROOT), (
     "importing the wrong hqq: %s (expected under %s) - run from the repo root"
     % (_hqq.__file__, _REPO_ROOT)
