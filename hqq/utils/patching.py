@@ -80,7 +80,11 @@ def patch_add_weight_param(layer, patch_param):
 # Optimize HQQLinear.forward for inference
 def patch_hqq_inference(layer, patch_param):
     def forward_hqq_inferece(self, x):
-        out = torch.matmul(x.to(self.device), self.dequantize().T)  # TODO GEMV use-case
+        # _quant_act honours this layer's act_bits and is a no-op when it is None, so a
+        # layer without activation quantization is unaffected. Without this, replacing
+        # `forward` here silently discarded activation quantization: the layer kept
+        # reporting act_bits=8 while actually running full-precision activations.
+        out = torch.matmul(self._quant_act(x).to(self.device), self.dequantize().T)  # TODO GEMV use-case
         if self.bias is not None:
             out += self.bias
         return out
@@ -136,6 +140,21 @@ def prepare_for_inference(
     patch_linearlayers(model, patch_hqq_inference)
     patch_linearlayers(model, patch_lora_inference)
     cleanup()
+
+    # gemlite/bitblas/torchao_int4 REPLACE the HQQLinear object with their own class, so
+    # they cannot honour act_bits - and silently ignoring it would mean reporting W4A8 while
+    # actually running W4A16. Refuse rather than produce wrong numbers.
+    if backend in ("gemlite", "bitblas", "torchao_int4"):
+        offenders = [
+            name for name, layer in model.named_modules()
+            if getattr(layer, "act_bits", None) is not None
+        ]
+        if offenders:
+            raise RuntimeError(
+                "backend=%r cannot apply activation quantization, but %d layer(s) have "
+                "act_bits set (e.g. %s). Either drop act_bits or stay on the native "
+                "backend, which does honour it." % (backend, len(offenders), offenders[0])
+            )
 
     if backend == "gemlite" and (patch_hqq_to_gemlite is not None):
         if patch_hqq_to_gemlite is None:
