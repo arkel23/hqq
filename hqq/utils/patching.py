@@ -156,9 +156,9 @@ def prepare_for_inference(
                 "backend, which does honour it." % (backend, len(offenders), offenders[0])
             )
 
-    if backend == "gemlite" and (patch_hqq_to_gemlite is not None):
+    if backend == "gemlite":
         if patch_hqq_to_gemlite is None:
-            raise RunTimeError(
+            raise RuntimeError(
                 """
                 GemLite backend is not available. Check if gemlite is correctly installed if you want to use the GemLite backend (https://github.com/mobiusml/gemlite/).
                 """
@@ -168,7 +168,7 @@ def prepare_for_inference(
 
     if backend == "bitblas":
         if patch_hqq_to_bitblas is None:
-            raise RunTimeError(
+            raise RuntimeError(
                 """
                 BitBlas backend is not available. Check if bitblas is correctly installed if you want to use the BitBlas backend (https://github.com/mobiusml/bitblas/).
                 """
