@@ -126,6 +126,78 @@ model = AutoHQQHFModel.from_quantized(save_dir)
 
 ❗ Note that models saved via the hqq lib are not compatible with `.from_pretrained()`
 
+### Activation Quantization and QAT (fork additions)
+
+> These two options are additions in this fork ([arkel23/hqq](https://github.com/arkel23/hqq)),
+> not in upstream. Both default to off, so existing code behaves exactly as before.
+
+`act_bits` fake-quantizes the **input activation** on every forward.
+`trainable=True` keeps a full-precision master weight so the weight itself can be **trained**
+through the quantizer — a plain `HQQLinear` can pass gradients to earlier layers but can never
+update its own weight (`grad_weight` is `None` by construction).
+
+```Python
+from hqq.core.quantize import HQQLinear, BaseQuantizeConfig
+
+layer = HQQLinear(your_linear_layer,
+                  quant_config=BaseQuantizeConfig(nbits=4, group_size=64),
+                  compute_dtype=torch.float16, device='cuda',
+                  act_bits=8,        # quantize activations to 8 bits (None = off)
+                  act_group_size=None,   # None = per-tensor
+                  trainable=True,    # keep an fp master weight + straight-through estimator
+                  )
+
+# train() and eval() differ on purpose:
+layer.train()   # scale/zero recomputed per step from the current weights (BitNet style)
+layer.eval()    # reuses the HQQ-calibrated scale/zero; only activations stay dynamic
+
+layer.recalibrate()  # re-run HQQ's solver after the weights have drifted
+layer.freeze()       # collapse back to a normal packed HQQLinear for deployment
+```
+
+With `trainable=True` the trainable parameter is `layer.master_weight`, **not** `layer.weight`
+— `transformers` monkey-patches `HQQLinear.weight` as a read-only property, so that name is
+unavailable.
+
+#### Via transformers `HqqConfig`
+
+No custom config class is needed. `HqqConfig` stores a plain dict that reaches `HQQLinear`
+untouched, so the options can be set on it directly:
+
+```Python
+from transformers import AutoModelForCausalLM, HqqConfig
+
+quant_config = HqqConfig(nbits=4, group_size=64)
+quant_config.quant_config['act_bits']  = 8
+quant_config.quant_config['trainable'] = True
+
+model = AutoModelForCausalLM.from_pretrained(
+    model_id, torch_dtype=torch.float16, device_map="cuda",
+    quantization_config=quant_config,
+)
+```
+With `dynamic_config` each layer gets its own dict, so these can be set per layer.
+
+#### Options
+
+- `act_bits` (int/float, default `None`): one of `1, 1.58, 2, 3, 4, 5, 6, 7, 8`; `None` leaves
+  activations in full precision. Activations are always quantized dynamically — there is
+  nothing to calibrate offline.
+- `act_group_size` (int, default `None`): channels sharing one activation scale. `None` is
+  per-tensor.
+- `trainable` (bool, default `False`): keep an fp `master_weight` and fake-quantize it with a
+  straight-through estimator. HQQ's real solver runs **once** at construction (honouring
+  `optimize`, default `True`), so training starts from genuine HQQ scales rather than plain
+  min/max. Only the master weight is stored — there is no packed `W_q` until `freeze()`.
+
+**Known quirk:** activation error is monotonic from 3 bits upward, but `act_bits=2` is *worse*
+than `act_bits=1.58`. At 2 bits the symmetric affine formula gives `Qp = 1`, i.e. levels
+`{-2,-1,0,1}` scaled by `1/max|x|`, while 1 and 1.58 bits use mean-absolute scaling. Measured
+relative error on a normal input: `1: 0.610, 1.58: 0.520, 2: 0.787, 3: 0.290, 8: 0.007`. Prefer
+1.58 over 2. `tests/test_hqqlinear_qat.py` pins this deliberately.
+
+See `tests/test_hqqlinear_qat.py` for runnable examples — CPU-only, no model download.
+
 ### Backends
 #### Native Backends
 The following native dequantization backends can be used by the `HQQLinear` module:
