@@ -586,6 +586,26 @@ class HQQLinear(nn.Module):
 
     # TODO: rewrite this mess
     def cuda(self, device):
+        if self.trainable:
+            # A trainable layer has no packed weight or meta until freeze(), so move what it
+            # does hold. Without this, accelerate's model.to(device) dies on meta[...] = ...
+            self.master_weight.data = self.master_weight.data.to(
+                device=device, dtype=self.compute_dtype
+            )
+            for name in ("calib_scale", "calib_zero"):
+                if name in self._buffers:
+                    self._buffers[name] = self._buffers[name].to(device)
+            if self.bias is not None:
+                if isinstance(self.bias, nn.Parameter):
+                    self.bias.data = self.bias.data.to(
+                        device=device, dtype=self.compute_dtype
+                    )
+                else:
+                    self.bias = self.bias.to(device=device, dtype=self.compute_dtype)
+            self.device = device
+            self.in_gpu = True
+            return self
+
         self.meta["compute_dtype"] = self.compute_dtype
 
         if isinstance(self.W_q, nn.parameter.Parameter):
