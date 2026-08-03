@@ -80,23 +80,31 @@ def patch_add_weight_param(layer, patch_param):
 # Optimize HQQLinear.forward for inference
 def patch_hqq_inference(layer, patch_param):
     def forward_hqq_inferece(self, x):
-        # _quant_act honours this layer's act_bits and is a no-op when it is None, so a
-        # layer without activation quantization is unaffected. Without this, replacing
-        # `forward` here silently discarded activation quantization: the layer kept
-        # reporting act_bits=8 while actually running full-precision activations.
-        out = torch.matmul(self._quant_act(x).to(self.device), self.dequantize().T)  # TODO GEMV use-case
+        out = torch.matmul(x.to(self.device), self.dequantize().T)  # TODO GEMV use-case
         if self.bias is not None:
             out += self.bias
         return out
 
+    def forward_hqq_inference_act(self, x):
+        return forward_hqq_inferece(self, self.quant_act(x))
+
+    # This replaces the layer's forward, including the one installed for act_bits, so the
+    # act-quantizing variant has to be picked here or the setting is silently dropped.
+    def _fwd(hqq_layer):
+        return (
+            forward_hqq_inference_act
+            if (hqq_layer.act_bits is not None)
+            else forward_hqq_inferece
+        )
+
     if type(layer) is HQQLinear:
-        layer.forward = lambda x: forward_hqq_inferece(layer, x)
+        fwd = _fwd(layer)
+        layer.forward = lambda x: fwd(layer, x)
 
     if type(layer) is HQQLinearLoRA:
         if type(layer.linear_layer) is HQQLinear:
-            layer.linear_layer.forward = lambda x: forward_hqq_inferece(
-                layer.linear_layer, x
-            )
+            fwd = _fwd(layer.linear_layer)
+            layer.linear_layer.forward = lambda x: fwd(layer.linear_layer, x)
 
     return layer
 
@@ -130,24 +138,23 @@ def recommended_inductor_config_setter():
     torch.set_float32_matmul_precision("high")
 
 
-def prepare_for_inference(
-    model, allow_merge=False, backend="default", verbose=False
-):
-    if backend == "torchao_int4":
-        allow_merge = False
+# Checked before anything is patched, so a rejected model is left untouched rather than
+# half-converted. getattr defaults: patch_linearlayers also admits HQQLinearLoRA, which has
+# neither attribute.
+def _reject_unsupported_layers(model, backend):
+    trainable = [n for n, l in model.named_modules() if getattr(l, "trainable", False)]
+    if trainable:
+        raise RuntimeError(
+            "%d layer(s) are still trainable=True (e.g. %s). Call freeze() on them first - "
+            "a trainable layer has no packed weight to run inference from."
+            % (len(trainable), trainable[0])
+        )
 
-    patch_linearlayers(model, patch_add_quant_config, patch_param=None)
-    patch_linearlayers(model, patch_hqq_inference)
-    patch_linearlayers(model, patch_lora_inference)
-    cleanup()
-
-    # gemlite/bitblas/torchao_int4 REPLACE the HQQLinear object with their own class, so
-    # they cannot honour act_bits - and silently ignoring it would mean reporting W4A8 while
-    # actually running W4A16. Refuse rather than produce wrong numbers.
+    # gemlite/bitblas/torchao_int4 replace the HQQLinear object with their own class and so
+    # cannot honour act_bits; ignoring it would report W4A8 while running W4A16.
     if backend in ("gemlite", "bitblas", "torchao_int4"):
         offenders = [
-            name for name, layer in model.named_modules()
-            if getattr(layer, "act_bits", None) is not None
+            n for n, l in model.named_modules() if getattr(l, "act_bits", None) is not None
         ]
         if offenders:
             raise RuntimeError(
@@ -155,6 +162,20 @@ def prepare_for_inference(
                 "act_bits set (e.g. %s). Either drop act_bits or stay on the native "
                 "backend, which does honour it." % (backend, len(offenders), offenders[0])
             )
+
+
+def prepare_for_inference(
+    model, allow_merge=False, backend="default", verbose=False
+):
+    if backend == "torchao_int4":
+        allow_merge = False
+
+    _reject_unsupported_layers(model, backend)
+
+    patch_linearlayers(model, patch_add_quant_config, patch_param=None)
+    patch_linearlayers(model, patch_hqq_inference)
+    patch_linearlayers(model, patch_lora_inference)
+    cleanup()
 
     if backend == "gemlite":
         if patch_hqq_to_gemlite is None:
