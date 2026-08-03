@@ -139,13 +139,13 @@ update its own weight (`grad_weight` is `None` by construction).
 ```Python
 from hqq.core.quantize import HQQLinear, BaseQuantizeConfig
 
-layer = HQQLinear(your_linear_layer,
-                  quant_config=BaseQuantizeConfig(nbits=4, group_size=64),
-                  compute_dtype=torch.float16, device='cuda',
-                  act_bits=8,        # quantize activations to 8 bits (None = off)
-                  act_group_size=None,   # None = per-tensor
-                  trainable=True,    # keep an fp master weight + straight-through estimator
-                  )
+quant_config = BaseQuantizeConfig(nbits=4, group_size=64,
+                                  act_bits=8,           # None (default) = off
+                                  act_group_size=None,  # None = per-tensor
+                                  trainable=True)       # fp master weight + STE
+
+layer = HQQLinear(your_linear_layer, quant_config=quant_config,
+                  compute_dtype=torch.float16, device='cuda')
 
 # train() and eval() differ on purpose:
 layer.train()   # scale/zero recomputed per step from the current weights (BitNet style)
@@ -155,28 +155,10 @@ layer.recalibrate()  # re-run HQQ's solver after the weights have drifted
 layer.freeze()       # collapse back to a normal packed HQQLinear for deployment
 ```
 
+The three options can also be passed as kwargs to `HQQLinear`, which override the config.
 With `trainable=True` the trainable parameter is `layer.master_weight`, **not** `layer.weight`
 — `transformers` monkey-patches `HQQLinear.weight` as a read-only property, so that name is
 unavailable.
-
-#### Via transformers `HqqConfig`
-
-No custom config class is needed. `HqqConfig` stores a plain dict that reaches `HQQLinear`
-untouched, so the options can be set on it directly:
-
-```Python
-from transformers import AutoModelForCausalLM, HqqConfig
-
-quant_config = HqqConfig(nbits=4, group_size=64)
-quant_config.quant_config['act_bits']  = 8
-quant_config.quant_config['trainable'] = True
-
-model = AutoModelForCausalLM.from_pretrained(
-    model_id, torch_dtype=torch.float16, device_map="cuda",
-    quantization_config=quant_config,
-)
-```
-With `dynamic_config` each layer gets its own dict, so these can be set per layer.
 
 #### Options
 
@@ -191,10 +173,28 @@ With `dynamic_config` each layer gets its own dict, so these can be set per laye
   min/max. Only the master weight is stored — there is no packed `W_q` until `freeze()`.
 
 **Known quirk:** activation error is monotonic from 3 bits upward, but `act_bits=2` is *worse*
-than `act_bits=1.58`. At 2 bits the symmetric affine formula gives `Qp = 1`, i.e. levels
-`{-2,-1,0,1}` scaled by `1/max|x|`, while 1 and 1.58 bits use mean-absolute scaling. Measured
-relative error on a normal input: `1: 0.610, 1.58: 0.520, 2: 0.787, 3: 0.290, 8: 0.007`. Prefer
-1.58 over 2. `tests/test_hqqlinear_qat.py` pins this deliberately.
+than `act_bits=1.58` — at 2 bits the symmetric affine formula gives `Qp = 1`, i.e. levels
+`{-2,-1,0,1}`, while 1 and 1.58 bits use mean-absolute scaling. Measured relative error:
+`1: 0.610, 1.58: 0.520, 2: 0.787, 3: 0.290, 8: 0.007`. Prefer 1.58 over 2.
+
+#### Via transformers `HqqConfig`
+
+`HqqConfig` discards unknown keyword arguments, so `HqqConfig(nbits=4, act_bits=8)` silently
+does **nothing**. Two routes do work, neither needing a change to `transformers`:
+
+```Python
+from transformers import AutoModelForCausalLM, HqqConfig
+
+quant_config = HqqConfig(nbits=4, group_size=64)
+quant_config.quant_config['act_bits']  = 8      # the dict reaches HQQLinear untouched
+quant_config.quant_config['trainable'] = True
+
+# or per layer, which is a full passthrough into BaseQuantizeConfig:
+HqqConfig(dynamic_config={'self_attn.q_proj': {'nbits': 4, 'group_size': 64, 'act_bits': 8}})
+```
+
+Note that these settings are **not** written to a checkpoint — `state_dict` serializes only
+`weight_quant_params` — so re-apply them after loading a saved model.
 
 #### Interaction with `prepare_for_inference`
 
@@ -204,10 +204,9 @@ The native path honours `act_bits`: `prepare_for_inference(model)` replaces each
 The **external** backends (`gemlite`, `bitblas`, `torchao_int4`) replace the `HQQLinear`
 object with their own class and cannot apply activation quantization at all, so
 `prepare_for_inference` raises if any layer has `act_bits` set rather than silently returning
-a model that runs full-precision activations. Drop `act_bits` or stay on the native backend.
-
-`prepare_for_inference` is an inference step; call `freeze()` on a `trainable=True` layer
-before using it.
+a model that runs full-precision activations. It likewise refuses a still-`trainable` layer;
+call `freeze()` first. Both checks run before anything is patched, so a rejected model is left
+untouched.
 
 See `tests/test_hqqlinear_qat.py` for runnable examples — CPU-only, no model download.
 
