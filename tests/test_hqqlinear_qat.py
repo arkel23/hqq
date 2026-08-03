@@ -296,6 +296,19 @@ class TestQAT(SeededTest):
                            "frozen layer still reflects the pre-training weight")
         print(f"\n  trained (moved {moved:.4f}), froze, matches fresh-from-trained ({err:.1e})")
 
+    def test_trainable_survives_device_move(self):
+        """cuda()/to() must work before freeze(). A trainable layer has no packed weight, so
+        meta is None and upstream's `self.meta["compute_dtype"] = ...` raised TypeError -
+        which is what accelerate's model.to(device) calls, so QAT training could not start."""
+        lay = layer(trainable=True)
+        self.assertIsNone(lay.meta, "a trainable layer should have no meta before freeze()")
+        x = torch.randn(4, IN, dtype=DTYPE)
+        lay.eval()
+        before = lay(x)
+        lay.cuda(DEV)  # the call accelerate makes; must not raise
+        self.assertLess(rel_err(lay(x), before), 1e-6, "moving the layer changed the output")
+        self.assertTrue(lay.master_weight.requires_grad, "master weight lost requires_grad")
+
     def test_freeze_keeps_act_quant(self):
         """freeze() flips trainable off, so the forward has to be reinstalled - otherwise the
         layer would keep calling forward_qat with no master weight, or drop act_bits entirely."""
