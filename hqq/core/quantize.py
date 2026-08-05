@@ -752,6 +752,16 @@ class HQQLinear(nn.Module):
 
         # Core data
         state = {"W_q": self.W_q}
+        # Activation settings, written as optional extra keys: -1 stands in for None, which
+        # safetensors cannot store. Deliberately NOT added to state_dict_keys() - transformers
+        # requires every listed key before it will convert a layer, so extending that set would
+        # strand every checkpoint saved before these flags existed.
+        state["act_bits"] = _encode_type(
+            float(self.act_bits if (self.act_bits is not None) else -1)
+        )
+        state["act_group_size"] = _encode_type(
+            int(self.act_group_size if (self.act_group_size is not None) else -1)
+        )
         state.update({k: _encode_type(v) for k, v in self.meta.items()})
 
         if self.bias is not None:
@@ -785,12 +795,14 @@ class HQQLinear(nn.Module):
     ):
         
         layer_state_dict = {}
-        for key in self.state_dict_keys():
+        # act_* are optional: absent in any checkpoint written before they existed.
+        optional = {"bias", "act_bits", "act_group_size"}
+        for key in self.state_dict_keys() | optional:
             if(prefix + key in state_dict):
                 layer_state_dict[key] = state_dict.pop(prefix + key)
             else:
-                if(key not in ['bias']):
-                    missing_keys.append(prefix + key)                    
+                if(key not in optional):
+                    missing_keys.append(prefix + key)
 
         if 'W_q' in layer_state_dict:
             layer_state_dict['W_q'] = nn.Parameter(layer_state_dict['W_q'], requires_grad=False)
@@ -835,6 +847,20 @@ class HQQLinear(nn.Module):
                 "zero_quant_params", None
             )
 
+        # Activation settings; -1 decodes back to None. Popped before the meta dict is built
+        # below, or they would land inside it. Absent in older checkpoints, where the values
+        # passed to __init__ stand instead.
+        if "act_bits" in state_dict:
+            # round(): 1.58 stored as fp32 comes back as 1.5800000429 and would fail the
+            # ACT_BITS_CHOICES check.
+            act_bits = round(_decode_type(state_dict.pop("act_bits"), float), 2)
+            self.act_bits = (
+                None if (act_bits == -1)
+                else (int(act_bits) if (act_bits == int(act_bits)) else act_bits)
+            )
+            act_group_size = _decode_type(state_dict.pop("act_group_size", -1), int)
+            self.act_group_size = None if (act_group_size == -1) else act_group_size
+
         # W_q/ bias
         self.W_q = state_dict.pop("W_q")
         self.bias = state_dict.pop("bias", None)
@@ -878,6 +904,12 @@ class HQQLinear(nn.Module):
 
         # Set in_features/out_features
         self.in_features, self.out_features = self.meta["shape"][::-1]
+
+        # Restoring the attributes is only half of it: without re-installing the forward the
+        # layer keeps the plain backend one and act_bits is silently ignored. Needs
+        # in_features, hence its position here.
+        self._validate_act_config()
+        self._install_forward()
 
     def quantize(
         self,

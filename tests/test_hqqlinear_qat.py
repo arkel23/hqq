@@ -412,6 +412,39 @@ class TestConfig(SeededTest):
         self.assertTrue(lay.trainable)
 
 
+    def test_act_flags_survive_state_dict(self):
+        """A reloaded layer must come back with its activation settings AND the matching
+        forward installed - restoring the attributes alone still runs the plain backend."""
+        x = torch.randn(4, IN, dtype=DTYPE)
+        for kwargs in ({"act_bits": 8}, {"act_bits": 8, "act_group_size": 32},
+                       {"act_bits": 1.58}):
+            src = layer(**kwargs)
+            src.eval()
+            fresh = HQQLinear(None, cfg(), compute_dtype=DTYPE, device=DEV)
+            fresh.load_state_dict(src.state_dict())
+            fresh.eval()  # module mode is not part of a state_dict; train() uses the STE form,
+            # which differs from the bare quantized tensor by 1 ulp at 1/1.58 bits
+            self.assertEqual(fresh.act_bits, src.act_bits, f"act_bits lost for {kwargs}")
+            self.assertEqual(fresh.act_group_size, src.act_group_size)
+            self.assertIn("forward", fresh.__dict__, f"forward not re-installed for {kwargs}")
+            self.assertTrue(torch.equal(fresh(x), src(x)), f"output changed for {kwargs}")
+
+        # a plain layer round-trips as plain
+        plain = layer(); plain.eval()
+        f2 = HQQLinear(None, cfg(), compute_dtype=DTYPE, device=DEV)
+        f2.load_state_dict(plain.state_dict())
+        self.assertIsNone(f2.act_bits)
+        self.assertNotIn("forward", f2.__dict__)
+
+        # and a checkpoint written before these keys existed still loads
+        old = src.state_dict()
+        del old["act_bits"], old["act_group_size"]
+        f3 = HQQLinear(None, cfg(), compute_dtype=DTYPE, device=DEV)
+        f3.load_state_dict(old)
+        self.assertIsNone(f3.act_bits, "a pre-flag checkpoint should keep the __init__ default")
+        print("\n  act flags survive state_dict round trip (incl. 1.58 and pre-flag checkpoints)")
+
+
 class _Model(nn.Module):
     """prepare_for_inference expects an HF-style model: it reads .device/.dtype off it."""
 
