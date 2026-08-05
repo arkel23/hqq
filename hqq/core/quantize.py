@@ -755,6 +755,21 @@ class HQQLinear(nn.Module):
                 k: _decode_type(v, _META_TYPE[k]) for k, v in state_dict.items()
             }  # safetensors version
 
+        # nbits is fractional for 1.58-bit, but _META_TYPE types it as int, so decoding truncated
+        # it to 1. Unpacking keys off meta["packing"], so the weights themselves were always
+        # correct - but this value is what bit accounting, freeze() and a re-save read.
+        # round(): the stored float32 decodes as 1.5800000429, which matches neither
+        # SUPPORTED_BITS nor bit_to_packing.
+        if "nbits" in state_dict:
+            raw = state_dict["nbits"]
+            nbits = round(float(raw.item() if isinstance(raw, Tensor) else raw), 2)
+            nbits = int(nbits) if (nbits == int(nbits)) else nbits
+            self.meta["nbits"] = nbits
+            if isinstance(self.quant_config, dict) and (
+                "weight_quant_params" in self.quant_config
+            ):
+                self.quant_config["weight_quant_params"]["nbits"] = nbits
+
         # Meta-data offloading
         if self.offload_meta is None:
             self.offload_meta = False
