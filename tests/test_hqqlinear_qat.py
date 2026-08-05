@@ -429,10 +429,15 @@ class TestConfig(SeededTest):
             self.assertIn("forward", fresh.__dict__, f"forward not re-installed for {kwargs}")
             self.assertTrue(torch.equal(fresh(x), src(x)), f"output changed for {kwargs}")
 
-        # a plain layer round-trips as plain
+        # a plain layer round-trips as plain, and must not add the keys at all: transformers
+        # reports unexpected checkpoint keys as unused, and that warning should only reach
+        # people who actually opted into activation quantization.
         plain = layer(); plain.eval()
+        plain_sd = plain.state_dict()
+        self.assertNotIn("act_bits", plain_sd, "a plain layer must not write act_bits")
+        self.assertNotIn("act_group_size", plain_sd)
         f2 = HQQLinear(None, cfg(), compute_dtype=DTYPE, device=DEV)
-        f2.load_state_dict(plain.state_dict())
+        f2.load_state_dict(plain_sd)
         self.assertIsNone(f2.act_bits)
         self.assertNotIn("forward", f2.__dict__)
 
