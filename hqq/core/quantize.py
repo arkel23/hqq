@@ -752,16 +752,18 @@ class HQQLinear(nn.Module):
 
         # Core data
         state = {"W_q": self.W_q}
-        # Activation settings, written as optional extra keys: -1 stands in for None, which
-        # safetensors cannot store. Deliberately NOT added to state_dict_keys() - transformers
-        # requires every listed key before it will convert a layer, so extending that set would
-        # strand every checkpoint saved before these flags existed.
-        state["act_bits"] = _encode_type(
-            float(self.act_bits if (self.act_bits is not None) else -1)
-        )
-        state["act_group_size"] = _encode_type(
-            int(self.act_group_size if (self.act_group_size is not None) else -1)
-        )
+        # Activation settings, written as optional extra keys, and only when actually in use:
+        # transformers' loader discards keys it does not expect and reports them as unused, so
+        # writing them unconditionally would put that warning on every hqq checkpoint. Their
+        # absence and act_bits=None are the same thing, so nothing is lost.
+        # Deliberately NOT added to state_dict_keys() - transformers requires every listed key
+        # before it will convert a layer, so extending that set would strand every checkpoint
+        # saved before these flags existed.
+        if self.act_bits is not None:
+            state["act_bits"] = _encode_type(float(self.act_bits))
+            state["act_group_size"] = _encode_type(
+                int(self.act_group_size if (self.act_group_size is not None) else -1)
+            )
         state.update({k: _encode_type(v) for k, v in self.meta.items()})
 
         if self.bias is not None:
