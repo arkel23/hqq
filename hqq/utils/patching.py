@@ -77,6 +77,34 @@ def patch_add_weight_param(layer, patch_param):
     return layer
 
 
+# Re-apply the activation settings from the saved quantization config after transformers'
+# from_pretrained(). Its loader rebuilds each HQQLinear from the checkpoint tensors alone and
+# filters the act_* keys out as unused, so a reloaded model runs full-precision activations
+# while config.json still says act_bits is set. Not needed for the plain hqq path, where
+# HQQLinear.load_state_dict restores them itself.
+def restore_act_quant(model):
+    qcfg = model.config.quantization_config
+    quant_config = qcfg["quant_config"] if isinstance(qcfg, dict) else qcfg.quant_config
+
+    def _tag(name):  # module name -> linear tag, only used for a per-layer dynamic_config
+        return ".".join(
+            n for n in name.split(".") if (n not in ("model", "layers")) and not n.isnumeric()
+        )
+
+    is_global = "weight_quant_params" in quant_config
+    for name, layer in model.named_modules():
+        if not isinstance(layer, HQQLinear):
+            continue
+        cfg = quant_config if is_global else quant_config.get(_tag(name))
+        if not cfg:
+            continue
+        layer.act_bits = cfg.get("act_bits")
+        layer.act_group_size = cfg.get("act_group_size")
+        layer._validate_act_config()
+        layer._install_forward()
+    return model
+
+
 # Optimize HQQLinear.forward for inference
 def patch_hqq_inference(layer, patch_param):
     def forward_hqq_inferece(self, x):

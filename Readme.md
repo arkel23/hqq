@@ -193,8 +193,24 @@ quant_config.quant_config['trainable'] = True
 HqqConfig(dynamic_config={'self_attn.q_proj': {'nbits': 4, 'group_size': 64, 'act_bits': 8}})
 ```
 
-Note that these settings are **not** written to a checkpoint — `state_dict` serializes only
-`weight_quant_params` — so re-apply them after loading a saved model.
+**Saving and reloading.** The activation settings are written into the checkpoint as optional
+extra keys, and `HQQLinear.load_state_dict` restores them — and re-installs the matching
+`forward` — on its own. That covers the plain hqq path.
+
+`transformers.from_pretrained` is different: it rebuilds each layer from the weight tensors
+alone and discards the extra keys (it lists them as "not used when initializing"). A reloaded
+model would then run full-precision activations while `config.json` still says `act_bits` is
+set, so call `restore_act_quant` after loading:
+
+```Python
+from hqq.utils.patching import restore_act_quant
+
+model = AutoModelForSpeechSeq2Seq.from_pretrained(save_dir, ...)
+restore_act_quant(model)   # reads the flags back out of config.json
+```
+
+Without it the output is silently wrong: on `whisper-tiny` at W1.58/A8 (`act_group_size=16`)
+the reloaded model differs from the original by `1.4e-2`; with it, by `0.0`.
 
 #### Interaction with `prepare_for_inference`
 
