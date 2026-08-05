@@ -178,6 +178,74 @@ class TestActQuant(SeededTest):
         self.assertLess(err, 1e-5, f"fake-quant and integer-matmul paths disagree: {err:.2e}")
         print(f"\n  fake-quant == integer matmul + post-rescale (rel_err={err:.2e})")
 
+    def test_activation_takes_only_2n_levels(self):
+        """The structural check: a b-bit activation must land on at most 2**b - 1 distinct
+        values within a group, and those values must sit on a uniform lattice.
+
+        2**b - 1, not 2**b: scale = Qp/max|x| bounds x*scale to [-Qp, Qp], so the extra negative
+        code Qn = -2**(b-1) is unreachable. 1 and 1.58 bits use a different scheme (sign and
+        ternary), giving 2 and 3 levels. At 2 bits Qp = 1, so it also yields only 3 - the
+        anomaly test_act_bits_monotonic pins numerically, here visible in the level set itself.
+
+        Read through the layer's own quant_act(), which is what forward_act_quant applies, and
+        the last assertion ties the two together so this cannot drift from the real forward.
+        """
+        levels = lambda b: 2 if b == 1 else (3 if b == 1.58 else 2 ** int(b) - 1)
+        x = torch.randn(4, IN, dtype=DTYPE)
+        counts = {}
+        for bits in (1, 1.58, 2, 3, 4, 8):
+            lay = layer(act_bits=bits)
+            lay.eval()
+            xq = lay.quant_act(x)
+            # the scale is per (token, group), so distinct values are only bounded within a group
+            group = xq[0, :IN]
+            u = group.unique()
+            bound = min(levels(bits), IN)
+            self.assertLessEqual(u.numel(), bound,
+                                 f"act_bits={bits} produced {u.numel()} levels, expected <= {bound}")
+            counts[bits] = u.numel()
+            # uniform lattice: every gap is an integer multiple of the smallest gap
+            if u.numel() > 2:
+                d = u[1:] - u[:-1]
+                mult = d / d.min()
+                self.assertTrue(torch.allclose(mult, mult.round(), atol=1e-3),
+                                f"act_bits={bits} levels are not uniformly spaced")
+
+        # the low-bit schemes are exact, and more bits must mean more levels
+        self.assertEqual(counts[1], 2, "1-bit is not binary")
+        self.assertEqual(counts[1.58], 3, "1.58-bit is not ternary")
+        self.assertEqual(counts[2], 3, "2-bit should also give 3 levels (Qp=1)")
+        self.assertLess(counts[2], counts[3])
+        self.assertLess(counts[3], counts[4])
+        self.assertLess(counts[4], counts[8])
+
+        # a grouped layer scales per group, so the whole tensor holds more levels than one group
+        g = 32
+        grouped = layer(act_bits=8, act_group_size=g)
+        grouped.eval()
+        yq = grouped.quant_act(x)
+        per_group = yq[0, :g].unique().numel()
+        self.assertLessEqual(per_group, min(255, g))
+        self.assertGreater(yq.unique().numel(), per_group,
+                           "whole tensor has no more levels than one group - scale is not per group")
+
+        # 8 bits only shows its full range with enough samples: bound is tight, and used
+        wide = fake_quant_activation(torch.randn(1, 4096, dtype=DTYPE), 8, None)
+        n = wide.unique().numel()
+        self.assertLessEqual(n, 255, f"8-bit produced {n} levels, more than 2**8 - 1")
+        self.assertGreater(n, 128, f"8-bit only reached {n} levels - the range looks unused")
+
+        # and the levels measured above are the ones the forward actually consumes
+        lay = layer(act_bits=4)
+        lay.eval()
+        direct = torch.matmul(lay.quant_act(x), lay.dequantize().t())
+        if lay.bias is not None:
+            direct = direct + lay.bias
+        self.assertLess(rel_err(lay(x), direct), 1e-6,
+                        "forward does not consume quant_act's output")
+        print("\n  levels per group: " + ", ".join(f"{b}b:{counts[b]}" for b in counts)
+              + f"; 8b over 4096 samples: {n} (<=255), uniform lattice")
+
     def test_act_config_validated_at_init(self):
         """act_bits/act_group_size are checked once at construction, not on every forward."""
         with self.assertRaises(AssertionError):
